@@ -4,8 +4,9 @@
 可直接执行的命令、预期结果和失败处理方式。文末的验证清单用于逐步确认环境与代码。
 
 - 适用代码：本仓库 `main`（`3c6d9b43`）+ `recipe/deepeyes` 的 Qwen3.5 适配。
-- 适用硬件：Atlas 800T A2 / 900 A2（910B）单机 8 卡；多机只需改 `NNODES`。
-- 关键开关：`MODEL_ID`、`MODEL_PATH`、`TRAIN_FILE`、`VAL_FILE`、`LLM_AS_A_JUDGE_BASE`。
+- 适用硬件：Atlas 800T A2 / 900 A2（910B）单机 8 卡；多机需先组建跨机 Ray 集群，再设置 `NNODES`（见 §8.1）。
+- 关键开关：`MODEL_ID`、`MODEL_PATH`、`TRAIN_FILE`、`VAL_FILE`、`LLM_AS_A_JUDGE_BASE`、
+  `LLM_AS_A_JUDGE_API_KEY`、`LLM_AS_A_JUDGE_MODEL`。
 
 ---
 
@@ -408,18 +409,56 @@ PY
 
 ## 6. 阶段 5：judge 服务与 reward
 
-### 6.1 起 judge
+### 6.1 部署 judge
 
-judge 需要 OpenAI 兼容接口。可与训练共卡（分卡）或另起节点。示例（占用 2 卡）：
+judge 只需 OpenAI 兼容接口（`/v1/models` 与 `/v1/chat/completions`），推荐部署在独立推理机；
+与训练同机分卡仅用于 smoke。
+
+**独立推理机（全量训练）**
+
+在 judge 机器上监听所有网卡（模型与 TP 按显存选择）：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+vllm serve ~/models/Qwen2.5-32B-Instruct \
+    --served-model-name judge --host 0.0.0.0 --tensor-parallel-size 2 \
+    --max-model-len 8192 --gpu-memory-utilization 0.9 --port 18901 \
+    --api-key <key>          # 不需要鉴权时省略
+```
+
+训练机器只配置地址，不启动本地服务，也不为 judge 保留 NPU：
+
+```bash
+export LLM_AS_A_JUDGE_BASE=http://<judge-ip>:18901/v1
+export LLM_AS_A_JUDGE_API_KEY=<key>    # 与服务端 --api-key 一致；无鉴权时省略
+export LLM_AS_A_JUDGE_MODEL=judge      # 可选；服务端不提供 /models 时必填
+
+curl -s -H "Authorization: Bearer ${LLM_AS_A_JUDGE_API_KEY}" \
+    "${LLM_AS_A_JUDGE_BASE}/models"
+```
+
+要求训练机器能访问 judge 的 18901 端口，且 `LLM_AS_A_JUDGE_BASE` 包含 `/v1`。
+
+> reward 打分在 Ray actor 中执行。单机由 `ray.init()` 自动拉起 Ray 时 shell 变量会被继承；
+> 预先启动的多机 Ray 集群不会继承，脚本会把 `LLM_AS_A_JUDGE_BASE`、`LLM_AS_A_JUDGE_MODEL`
+> 注入 `ray_kwargs.ray_init.runtime_env.env_vars`。`LLM_AS_A_JUDGE_API_KEY` 不写入命令行和日志，
+> 需在每台节点 `ray start` 前导出，或通过私有配置传入 runtime_env。
+
+**同机分卡（仅 smoke）**
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=6,7
-vllm serve ~/models/Qwen2.5-72B-Instruct \   # 或 Qwen3.5-4B/9B 等任意强模型
+vllm serve ~/models/Qwen3.5-9B \
     --served-model-name judge --tensor-parallel-size 2 \
     --max-model-len 8192 --gpu-memory-utilization 0.6 --port 18901
-# 若与训练同机，训练脚本里把 NDEVICES_PER_NODE 设为 6，并让 Ray 只看到 0-5 卡
 export LLM_AS_A_JUDGE_BASE=http://127.0.0.1:18901/v1
 ```
+
+此时训练脚本需把 `NDEVICES_PER_NODE` 减为剩余卡数，并让 Ray 只看到训练卡。
+
+**吞吐**：reward 默认由 `reward.num_workers=8` 个 Ray worker 分片并行打分，每个 worker 内部
+再并发调用 judge。judge 侧按 `train_batch_size × rollout.n / 步时长` 估算 QPS 并配置
+`--max-num-seqs` 或多副本；judge 较慢时可用 `reward.num_workers=<n>` 下调并发。
 
 > 资源紧张时可直接把 `LLM_AS_A_JUDGE_BASE` 指向 Qwen3.5-4B 服务；此时 accuracy 项质量下降，
 > 但流程可完整跑通。未设置该变量时 accuracy 恒为 0，只剩 format/tool 两项。
@@ -468,6 +507,9 @@ bash recipe/deepeyes/run_deepeyes_grpo_qwen3_5_4b.sh \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=3
 ```
 
+> 使用独立 judge 时去掉 `ASCEND_RT_VISIBLE_DEVICES=4,5,6,7` 和 `RAY_NOSET_VISIBLE_DEVICES=0`：
+> 训练机使用全部 8 卡（`NDEVICES_PER_NODE=8`、`GEN_TP=2`），judge 不占用本地显存。
+
 smoke 通过的标准（日志关键字）：
 
 1. 4 个 vLLM-Ascend engine 起来，权重同步完成（`update_weights` / `wake_up` 无报错）。
@@ -506,6 +548,33 @@ bash recipe/deepeyes/run_deepeyes_grpo_qwen3_5_9b.sh
 checkpoint：`trainer.default_local_dir` 下按 `global_step_*` 保存；
 `actor.checkpoint.save_contents` 控制内容（`model`,`hf_model`,`optimizer`,`extra`）。
 
+### 8.1 推理与训练分机部署
+
+本配方涉及两类推理：
+
+- **judge（reward）**：只通过 `LLM_AS_A_JUDGE_BASE` 访问，独立推理机开箱可用（§6.1）。
+  训练机不需要为 judge 留卡，按整机 8 卡启动训练即可。
+- **策略 rollout**：vLLM-Ascend 与 FSDP2 在训练卡上共置（hybrid engine），本配方使用的
+  `main_ppo` 同步训练器不支持将 rollout 放到独立机器。
+
+若必须把策略推理与训练分机部署，verl 提供 V1 `separate_async` 模式（独立 rollout 资源池）：
+
+```bash
+trainer.v1.trainer_mode=separate_async \
+trainer.v1.separate_async.parameter_sync_step=4 \
+actor_rollout_ref.rollout.nnodes=<rollout 节点数> \
+actor_rollout_ref.rollout.n_gpus_per_node=8 \
+actor_rollout_ref.rollout.checkpoint_engine.backend=nccl \
+data.train_batch_size=64 \
+actor_rollout_ref.actor.ppo_mini_batch_size=16
+```
+
+`checkpoint_engine.backend=nccl` 在 Ascend 上对应 HCCL 实现。该模式需要跨机权重同步；
+本配方的脚本与本文档尚未在 Ascend + Qwen3.5 多轮 agent loop 上验证，上线前需单独跑通 1 step。
+常规多机扩展仍是每节点 colocate：head 节点 `ray start --head`，其余节点
+`ray start --address=<head>`，再设置 `NNODES=<节点数>`、`NDEVICES_PER_NODE=8`，
+rollout 与训练共享每节点的 8 卡。
+
 ---
 
 ## 9. 故障排查
@@ -521,7 +590,10 @@ checkpoint：`trainer.default_local_dir` 下按 `global_step_*` 保存；
 | `filter dataset len: 0` 且日志刷 `AttributeError: 'CustomRLHFDatasetQwen35' object has no attribute '_build_messages'` | `custom_cls.path` 写成文件路径时，verl 用 `custom_module_<hash>` 动态加载且不注册 `sys.modules`；`datasets.filter` 用 dill 序列化回调会把类按值重建，继承来的方法丢失 | `custom_cls.path` 改用包路径 `pkg://recipe.deepeyes.deepeyes`（reward 路径同理），模块可正常 import、按引用 pickle |
 | worker 创建时 `c10_npu::SetDevice(...) error code is 107001` | 共享机器上用了非 0 起的卡子集（如 `ASCEND_RT_VISIBLE_DEVICES=4,5,6,7`）且保持 `RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1`：Ray 返回物理卡号，verl 调 `set_device(4)`，而 torch_npu 只接受可见列表内的 0..3 | 设 `RAY_NOSET_VISIBLE_DEVICES=0` 且 `GEN_TP=1`（Ray 给每个 actor 单卡，无需手工 set_device）；整机 0 起全卡时保持默认 NOSET=1 以支持 TP>1 |
 | `tokenization_sanity_check` 警告/报错 | 模板逐轮回渲与 rollout token 有空白差异 | 加 `actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=ignore_strippable`（或 `disable`） |
-| reward 恒为 0 | judge 未设置/不可达 | `curl $LLM_AS_A_JUDGE_BASE/models`；查看 `LLM_AS_A_JUDGE_BASE` |
+| reward 恒为 0 | judge 未设置/不可达/鉴权失败 | `curl -H "Authorization: Bearer $LLM_AS_A_JUDGE_API_KEY" $LLM_AS_A_JUDGE_BASE/models`；查看 `LLM_AS_A_JUDGE_BASE` |
+| judge 返回 401/403 | 服务端启用了 `--api-key` | 设置 `LLM_AS_A_JUDGE_API_KEY` |
+| judge 返回 400/422 | 服务端不接受 `chat_template_kwargs` | 客户端会自动重试一次不带该字段；仍失败则检查服务端请求体 |
+| 独立 judge 首次探测失败 | 网络未通或 judge 尚未启动 | 客户端每 60 秒重试；也可设置 `LLM_AS_A_JUDGE_MODEL` 跳过 `/models` 探测 |
 | 工具调用全部失败 | bbox 越界/过小 | 正常会被裁剪放大；若密集失败，检查 `min_dimension=32` 与数据图尺寸 |
 | NPU OOM（训练侧） | offload/长度/批大小 | `TRAIN_BATCH_SIZE` ↓、`MAX_PROMPT_LENGTH` ↓、确认 param/optimizer offload 开启 |
 | NPU OOM（rollout 侧） | KV cache | `ROLLOUT_GPU_MEM_UTIL` ↓、`GEN_TP` ↑、`MAX_NUM_BATCHED_TOKENS` ↓ |
@@ -543,6 +615,7 @@ checkpoint：`trainer.default_local_dir` 下按 `global_step_*` 保存；
 | V8 | judge + reward 联调 | §6 | ✅ 通过（真实服务当 judge：正确工具答案 score=2.0；无工具/格式错误答案 score=0.6） |
 | V9 | 1-step 训练闭环 | §7 | ✅ 通过（4 卡 4B：reward mean 0.325 / max 2.0，num_turns 4–6，KL 0.0036，rollout-train logprob corr 0.9988，grad_norm 1.81，单步 355 s） |
 | V10 | 9B 模型加载/smoke | 复制 §7 改 `MODEL_PATH` | ✅ V10a（9B TP=2 服务：文本/图像/judge 正常，39.4 GB/卡）；V10b（1-step，2048 token/3 轮 → 全部截断、reward 退化）；V10c（8192 token/5 轮 → reward mean 0.35 / max 1.8，grad_norm 8.25，num_turns 6–10） |
+| V11 | judge 独立推理机接入 | §6.1、§11 | ✅ 本地 mock 服务通过（API Key、422 回退、无 `/models`、不可达重试）；未接第二台物理机 |
 
 > 验证过程中如修改了环境或代码，请同步更新本表的“状态”列，保持文档与实际一致。
 
@@ -607,3 +680,13 @@ bash recipe/deepeyes/run_deepeyes_grpo_qwen3_5_4b.sh \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=3 \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=3
 ```
+
+### judge 远程接入（2026-10-29）
+
+本地 mock 服务验证了三种独立推理机场景，未接入第二台物理机：
+
+- `LLM_AS_A_JUDGE_API_KEY`：`/models` 返回 401，携带 Bearer 后通过。
+- 服务端拒绝 `chat_template_kwargs`（HTTP 422）：客户端自动重试不带该字段，`acc=1.0`，
+  后续请求不再携带。
+- 不提供 `/models`：设置 `LLM_AS_A_JUDGE_MODEL` 后跳过探测，`acc=1.0`。
+- judge 不可达：`acc=0` 且每 60 秒重试，不会永久禁用。

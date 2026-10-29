@@ -148,34 +148,56 @@ def _collect_images(messages: list[dict[str, Any]]) -> list[Any]:
 _JUDGE_BASE_URL = ""
 _JUDGE_MODEL = ""
 _JUDGE_READY = False
+_JUDGE_NEXT_PROBE = 0.0
+_JUDGE_TEMPLATE_KWARGS = True
+_JUDGE_PROBE_INTERVAL = 60.0
+
+
+def _judge_headers() -> dict[str, str]:
+    api_key = os.environ.get("LLM_AS_A_JUDGE_API_KEY", "").strip()
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
 def _get_judge() -> tuple[str, str]:
-    """Resolve ``LLM_AS_A_JUDGE_BASE`` and its model name once per process."""
-    global _JUDGE_BASE_URL, _JUDGE_MODEL, _JUDGE_READY
+    """Resolve the judge endpoint and model name.
+
+    The endpoint may run on another host. ``LLM_AS_A_JUDGE_MODEL`` skips the
+    ``/models`` query when the server does not expose it.
+    """
+    global _JUDGE_BASE_URL, _JUDGE_MODEL, _JUDGE_READY, _JUDGE_NEXT_PROBE
     if _JUDGE_READY:
         return _JUDGE_BASE_URL, _JUDGE_MODEL
+    if time.monotonic() < _JUDGE_NEXT_PROBE:
+        return "", ""
 
-    _JUDGE_READY = True
     base_url = os.environ.get("LLM_AS_A_JUDGE_BASE", "").strip().rstrip("/")
     if not base_url:
         logger.warning("LLM_AS_A_JUDGE_BASE is not set; DeepEyes accuracy reward is disabled.")
+        _JUDGE_READY = True
         return "", ""
 
-    try:
-        response = requests.get(f"{base_url}/models", timeout=10.0)
-        response.raise_for_status()
-        models = response.json()
-        model_name = models["data"][0]["id"] if models.get("data") else ""
-    except (requests.exceptions.RequestException, KeyError, IndexError, ValueError) as e:
-        logger.warning(f"Failed to query models from {base_url}: {e}. DeepEyes accuracy reward is disabled.")
-        return "", ""
+    model_name = os.environ.get("LLM_AS_A_JUDGE_MODEL", "").strip()
+    if not model_name:
+        try:
+            response = requests.get(f"{base_url}/models", headers=_judge_headers(), timeout=10.0)
+            response.raise_for_status()
+            models = response.json()
+            model_name = models["data"][0]["id"] if models.get("data") else ""
+        except (requests.exceptions.RequestException, KeyError, IndexError, ValueError) as e:
+            _JUDGE_NEXT_PROBE = time.monotonic() + _JUDGE_PROBE_INTERVAL
+            logger.warning(
+                f"Failed to query models at {base_url}: {e}. Accuracy reward stays 0 and the query is "
+                f"retried in {_JUDGE_PROBE_INTERVAL:.0f}s; set LLM_AS_A_JUDGE_MODEL to skip model discovery."
+            )
+            return "", ""
 
     if not model_name:
-        logger.warning(f"No models found at {base_url}. DeepEyes accuracy reward is disabled.")
+        _JUDGE_NEXT_PROBE = time.monotonic() + _JUDGE_PROBE_INTERVAL
+        logger.warning(f"No models found at {base_url}; set LLM_AS_A_JUDGE_MODEL to skip model discovery.")
         return "", ""
 
     _JUDGE_BASE_URL, _JUDGE_MODEL = base_url, model_name
+    _JUDGE_READY = True
     logger.info(f"DeepEyes judge: {model_name} @ {base_url}")
     return _JUDGE_BASE_URL, _JUDGE_MODEL
 
@@ -254,6 +276,22 @@ def compute_score(
     }
 
 
+def _post_judge(base_url: str, payload: dict[str, Any]) -> requests.Response:
+    """POST to the judge, retrying without ``chat_template_kwargs`` if rejected."""
+    global _JUDGE_TEMPLATE_KWARGS
+    request = dict(payload)
+    if not _JUDGE_TEMPLATE_KWARGS:
+        request.pop("chat_template_kwargs", None)
+
+    response = requests.post(f"{base_url}/chat/completions", json=request, headers=_judge_headers(), timeout=60.0)
+    if response.status_code in (400, 422) and "chat_template_kwargs" in request:
+        logger.info(f"Judge rejected chat_template_kwargs (HTTP {response.status_code}); retrying without it.")
+        _JUDGE_TEMPLATE_KWARGS = False
+        request.pop("chat_template_kwargs", None)
+        response = requests.post(f"{base_url}/chat/completions", json=request, headers=_judge_headers(), timeout=60.0)
+    return response
+
+
 def _judge_accuracy(question_text: str, ground_truth: str, answer_text: str) -> float:
     base_url, model_name = _get_judge()
     if not base_url or not model_name:
@@ -304,7 +342,7 @@ def _judge_accuracy(question_text: str, ground_truth: str, answer_text: str) -> 
     response = None
     for attempt in range(3):
         try:
-            http_response = requests.post(f"{base_url}/chat/completions", json=payload, timeout=60.0)
+            http_response = _post_judge(base_url, payload)
             http_response.raise_for_status()
             response = (http_response.json()["choices"][0]["message"]["content"] or "").strip()
             break

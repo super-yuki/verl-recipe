@@ -88,6 +88,14 @@ fi
 if [[ -z "${LLM_AS_A_JUDGE_BASE}" ]]; then
     echo "LLM_AS_A_JUDGE_BASE is empty: accuracy reward will stay at 0." >&2
 fi
+# Reward scoring runs in Ray actors, which do not inherit the shell environment
+# of an already started Ray cluster.
+JUDGE_ENV=()
+for var in LLM_AS_A_JUDGE_BASE LLM_AS_A_JUDGE_MODEL; do
+    if [[ -n "${!var:-}" ]]; then
+        JUDGE_ENV+=("+ray_kwargs.ray_init.runtime_env.env_vars.${var}=${!var}")
+    fi
+done
 if ! "${PYTHON}" -c "import verl" >/dev/null 2>&1; then
     echo "Interpreter '${PYTHON}' cannot import verl. Activate the training environment or set PYTHON=<path>." >&2
     exit 1
@@ -181,6 +189,9 @@ TRAINER=(
 )
 
 ########################### launch ###########################
+if ((${#JUDGE_ENV[@]})); then
+    set -- "${JUDGE_ENV[@]}" "$@"
+fi
 PYTHONUNBUFFERED=1 "${PYTHON}" -m verl.trainer.main_ppo \
     --config-path="${SCRIPT_DIR}/configs" \
     --config-name=deepeyes_multiturn_grpo_qwen3_5 \
